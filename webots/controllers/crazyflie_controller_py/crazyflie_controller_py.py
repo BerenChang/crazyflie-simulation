@@ -164,6 +164,8 @@ if __name__ == '__main__':
         m2_motor.setVelocity(motor_power[1])
         m3_motor.setVelocity(-motor_power[2])
         m4_motor.setVelocity(motor_power[3])
+        
+        print(motor_power)
 
         past_time = robot.getTime()
         past_x_global = x_global

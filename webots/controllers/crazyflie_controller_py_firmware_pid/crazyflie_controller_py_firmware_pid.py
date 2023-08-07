@@ -25,9 +25,11 @@ from controller import DistanceSensor
 
 from math import cos, sin, degrees, radians
 
+import numpy as np
+
 import sys
 # Change this path to your crazyflie-firmware folder
-sys.path.append('../../../../../c/crazyflie-firmware')
+sys.path.append('../../../../crazyflie-firmware/build')
 import cffirmware
 
 robot = Robot()
@@ -66,6 +68,10 @@ range_back.enable(timestep)
 range_right = robot.getDevice("range_right")
 range_right.enable(timestep)
 
+## Crazyflie parameters
+armLength = 0.031  # 0.046
+thrustToTorque = 0.6  # 0.005964552
+
 ## Get keyboard
 keyboard = Keyboard()
 keyboard.enable(timestep)
@@ -77,7 +83,43 @@ pastZGlobal = 0
 
 past_time = robot.getTime()
 
-cffirmware.controllerPidInit()
+ctrl = cffirmware.controllerMellinger_t()
+cffirmware.controllerMellingerInit(ctrl)
+ctrl.massThrust = 1  #  132000
+ctrl.mass = 0.027
+
+#  XY Position PID
+ctrl.kp_xy = 0.0# 0.04  # 0.4       # P
+ctrl.kd_xy = 0.0# 0.01  # 0.2       # D
+ctrl.ki_xy = 0.0  # 0.05      # I
+ctrl.i_range_xy = 0.0 #  2.0
+
+#  Z Position done
+ctrl.kp_z = 0.2  #  1.25       # P
+ctrl.kd_z = 0.1  #  0.4        # D
+ctrl.ki_z = 0.0  #  0.5       # I
+ctrl.i_range_z  = 0.0  #  0.4
+
+#  Attitude
+ctrl.kR_xy = 0.0#  0.01  #  70000  # 70000, # P
+ctrl.kw_xy = 0.0# 0.001  #  20000  # 20000, # D
+ctrl.ki_m_xy = 0.0 # I
+ctrl.i_range_m_xy = 0.0  #  1.0
+
+#  Yaw done
+ctrl.kR_z = 0.4 # 0.9999999701 # 60000  # 60000, # P
+ctrl.kw_z = 0.2  # 12000  # 12000, # D
+ctrl.ki_m_z = 0.0  # 500 # 500, # I
+ctrl.i_range_m_z  = 0.0  # 1500 # 1500,
+
+# roll and pitch angular velocity
+ctrl.kd_omega_rp = 0.0  # 200 # 200 # D
+
+prev_omega_roll = 0.0
+prev_omega_pitch = 0.0
+prev_setpoint_omega_roll = 0.0
+prev_setpoint_omega_pitch = 0.0
+GRAVITY_MAGNITUDE = 9.81
 
 print('Take off!')
 
@@ -99,7 +141,6 @@ while robot.step(timestep) != -1:
     vyGlobal = (yGlobal - pastYGlobal)/dt
     zGlobal = gps.getValues()[2]
     vzGlobal = (zGlobal - pastZGlobal)/dt
-
 
     ## Put measurement in state estimate
     # TODO replace these with a EKF python binding
@@ -124,6 +165,7 @@ while robot.step(timestep) != -1:
     forwardDesired = 0
     sidewaysDesired = 0
     yawDesired = 0
+    height_diff_desired = 0
 
     key = keyboard.getKey()
     while key>0:
@@ -148,12 +190,19 @@ while robot.step(timestep) != -1:
 
     ## Fill in Setpoints
     setpoint = cffirmware.setpoint_t()
+    
+    setpoint.mode.x = cffirmware.modeAbs
+    setpoint.mode.y = cffirmware.modeAbs
     setpoint.mode.z = cffirmware.modeAbs
+    setpoint.mode.yaw = cffirmware.modeAbs
+    
     setpoint.position.z = 1.0
-    setpoint.mode.yaw = cffirmware.modeVelocity
+    setpoint.position.x = forwardDesired
+    # setpoint.position.y = 0.0
+    
     setpoint.attitudeRate.yaw = degrees(yawDesired)
-    setpoint.mode.x = cffirmware.modeVelocity
-    setpoint.mode.y = cffirmware.modeVelocity
+    setpoint.attitude.yaw = 0
+    
     setpoint.velocity.x = forwardDesired
     setpoint.velocity.y = sidewaysDesired
     setpoint.velocity_body = True
@@ -161,25 +210,130 @@ while robot.step(timestep) != -1:
     ## Firmware PID bindings
     control = cffirmware.control_t()
     tick = 100 #this value makes sure that the position controller and attitude controller are always always initiated
-    cffirmware.controllerPid(control, setpoint,sensors,state,tick)
+    # cffirmware.controllerPid(control, setpoint,sensors,state,tick)
+    
+    
+    # cffirmware.controllerMellinger(ctrl, control, setpoint, sensors, state, tick)
+    ############################################ cffirmware in python
+    setpointPos = np.array([setpoint.position.x, setpoint.position.y, setpoint.position.z])
+    setpointVel = np.array([setpoint.velocity.x, setpoint.velocity.y, setpoint.velocity.z])
+    statePos = np.array([state.position.x, state.position.y, state.position.z])
+    stateVel = np.array([state.velocity.x, state.velocity.y, state.velocity.z])
+    
+    r_error = setpointPos - statePos
+    v_error = setpointVel - stateVel
+    
+    # print(r_error)
+    
+    # integral error
+    i_error_x = 0.0
+    i_error_y = 0.0
+    i_error_z = 0.0
+    
+    target_thrust = np.array([0.0, 0.0, 0.0])
+    target_thrust[0] = ctrl.mass * setpoint.acceleration.x + ctrl.kp_xy * r_error[0] + ctrl.kd_xy * v_error[0] + ctrl.ki_xy * i_error_x
+    target_thrust[1] = ctrl.mass * setpoint.acceleration.y + ctrl.kp_xy * r_error[1] + ctrl.kd_xy * v_error[1] + ctrl.ki_xy * i_error_y
+    target_thrust[2] = ctrl.mass * (setpoint.acceleration.z + GRAVITY_MAGNITUDE) + ctrl.kp_z * r_error[2] + ctrl.kd_z * v_error[2] + ctrl.ki_z * i_error_z
+    
+    desiredYaw = setpoint.attitude.yaw
+    
+    z_axis = np.array([cos(roll) * sin(pitch) * cos(yaw) + sin(roll) * sin(yaw), cos(roll) * sin(pitch) * cos(yaw) - sin(roll) * sin(yaw), cos(roll) * cos(pitch)])
+    current_thrust = np.dot(target_thrust, z_axis)
+    z_axis_desired = target_thrust / np.linalg.norm(target_thrust)
+    
+    x_c_des = np.array([cos(radians(desiredYaw)), sin(radians(desiredYaw)), 0])
 
+    y_axis_desired = np.cross(z_axis_desired, x_c_des)
+    y_axis_desired = y_axis_desired / np.linalg.norm(y_axis_desired)
+    x_axis_desired = np.cross(y_axis_desired, z_axis_desired)
+    
+    R = np.matrix([[cos(pitch)*cos(yaw), sin(roll)*sin(pitch)*cos(yaw) - cos(roll)*sin(yaw), cos(roll)*sin(pitch)*cos(yaw) + sin(roll)*sin(yaw)],
+                   [cos(pitch)*sin(yaw), sin(roll)*sin(pitch)*sin(yaw) + cos(roll)*cos(yaw), cos(roll)*sin(pitch)*sin(yaw) - sin(roll)*cos(yaw)],
+                   [-sin(pitch), sin(roll) * cos(pitch), cos(roll)*cos(pitch)]])
+    R_transpose = R.T
+    Rdes_transpose = np.matrix([x_axis_desired, y_axis_desired, z_axis_desired])
+    Rdes = Rdes_transpose.T
+        
+    eRM = np.subtract(np.matmul(Rdes_transpose, R), np.matmul(R_transpose, Rdes))
+    eR_x = eRM[2, 1]
+    eR_y = -eRM[0, 2]
+    eR_z = eRM[1, 0]
+    
+    err_d_roll = 0.0
+    err_d_pitch = 0.0
+    
+    stateAttitudeRateRoll = radians(sensors.gyro.x)
+    stateAttitudeRatePitch = -radians(sensors.gyro.y)
+    stateAttitudeRateYaw = radians(sensors.gyro.z)
+    
+    ew_x = radians(setpoint.attitudeRate.roll) - stateAttitudeRateRoll
+    print("set w", radians(setpoint.attitudeRate.roll))
+    print("state w", stateAttitudeRateRoll)
+    ew_y = -radians(setpoint.attitudeRate.pitch) - stateAttitudeRatePitch
+    ew_z = radians(setpoint.attitudeRate.yaw) - stateAttitudeRateYaw
+
+    err_d_roll = ((radians(setpoint.attitudeRate.roll) - prev_setpoint_omega_roll) - (stateAttitudeRateRoll - prev_omega_roll)) / dt
+    err_d_pitch = (-(radians(setpoint.attitudeRate.pitch) - prev_setpoint_omega_pitch) - (stateAttitudeRatePitch - prev_omega_pitch)) / dt
+   
+    prev_omega_roll = stateAttitudeRateRoll
+    prev_omega_pitch = stateAttitudeRatePitch
+    prev_setpoint_omega_roll = radians(setpoint.attitudeRate.roll)
+    prev_setpoint_omega_pitch = radians(setpoint.attitudeRate.pitch)
+    
+    i_error_m_x = 0
+    i_error_m_y = 0
+    i_error_m_z = 0
+        
+    M_x = ctrl.kR_xy * eR_x + ctrl.kw_xy * ew_x + ctrl.ki_m_xy * ctrl.i_error_m_x + ctrl.kd_omega_rp * err_d_roll
+    M_y = -ctrl.kR_xy * eR_y + ctrl.kw_xy * ew_y + ctrl.ki_m_xy * ctrl.i_error_m_y + ctrl.kd_omega_rp * err_d_pitch
+    M_z = -ctrl.kR_z  * eR_z + ctrl.kw_z  * ew_z + ctrl.ki_m_z  * ctrl.i_error_m_z
+        
+    control.thrust = ctrl.massThrust * current_thrust
+    
+    ####################################################### cffirmware in python
+
+    print("M_x component", eR_x, ew_x, err_d_roll)
+    print("control signal", control.thrust, M_x, M_y, M_z)
+    
     ##
-    cmd_roll = radians(control.roll)
-    cmd_pitch = radians(control.pitch)
-    cmd_yaw = -radians(control.yaw)
     cmd_thrust = control.thrust
+    cmd_roll = radians(M_x)
+    cmd_pitch = radians(M_y)
+    cmd_yaw = -radians(M_z)
+    
+    
+    
+    ## get thrust f1-f4 from thrust roll pitch yaw
+    thrust1 = 0.25*cmd_thrust + cmd_pitch / (2*armLength) - cmd_yaw / (4*thrustToTorque)
+    thrust2 = 0.25*cmd_thrust - cmd_roll / (2*armLength) + cmd_yaw / (4*thrustToTorque)
+    thrust3 = 0.25*cmd_thrust - cmd_pitch / (2*armLength) - cmd_yaw / (4*thrustToTorque)
+    thrust4 = 0.25*cmd_thrust + cmd_roll / (2*armLength) + cmd_yaw / (4*thrustToTorque)
+
+    motor1 = (abs(thrust1 / 4e-05))**0.5
+    motor2 = (abs(thrust2 / 4e-05))**0.5
+    motor3 = (abs(thrust3 / 4e-05))**0.5
+    motor4 = (abs(thrust4 / 4e-05))**0.5
+    
+    print("motor input", motor1, motor2, motor3, motor4)
+    
+    m1_motor.setVelocity(-motor1)
+    m2_motor.setVelocity(motor2)
+    m3_motor.setVelocity(-motor3)
+    m4_motor.setVelocity(motor4)
+    
+    
 
     ## Motor mixing
-    motorPower_m1 =  cmd_thrust - cmd_roll + cmd_pitch + cmd_yaw
-    motorPower_m2 =  cmd_thrust - cmd_roll - cmd_pitch - cmd_yaw
-    motorPower_m3 =  cmd_thrust + cmd_roll - cmd_pitch + cmd_yaw
-    motorPower_m4 =  cmd_thrust + cmd_roll + cmd_pitch - cmd_yaw
-
-    scaling = 1000 ##Todo, remove necessity of this scaling (SI units in firmware)
-    m1_motor.setVelocity(-motorPower_m1/scaling)
-    m2_motor.setVelocity(motorPower_m2/scaling)
-    m3_motor.setVelocity(-motorPower_m3/scaling)
-    m4_motor.setVelocity(motorPower_m4/scaling)
+    # motorPower_m1 =  cmd_thrust - cmd_roll + cmd_pitch + cmd_yaw
+    # motorPower_m2 =  cmd_thrust - cmd_roll - cmd_pitch - cmd_yaw
+    # motorPower_m3 =  cmd_thrust + cmd_roll - cmd_pitch + cmd_yaw
+    # motorPower_m4 =  cmd_thrust + cmd_roll + cmd_pitch - cmd_yaw
+    
+    # scaling = 1 ##Todo, remove necessity of this scaling (SI units in firmware) 1000
+    # m1_motor.setVelocity(-motorPower_m1/scaling)
+    # m2_motor.setVelocity(motorPower_m2/scaling)
+    # m3_motor.setVelocity(-motorPower_m3/scaling)
+    # m4_motor.setVelocity(motorPower_m4/scaling)
 
     past_time = robot.getTime()
     pastXGlobal = xGlobal
